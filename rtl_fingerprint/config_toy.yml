@@ -1,0 +1,26 @@
+# config_toy.yml
+
+frontend: "toy"   # 换成 "uhdm" 则走 Surelog/UHDM 前端
+
+rtl:
+  filelist: "chipyard_filelist.f"   # toy 前端不会真正用到
+  top_module: "DigitalTop"
+  defines: []
+
+targets:
+  mechanisms: ["mapping", "queue"]
+  modules:
+    - "*dcache*"
+  signal_patterns:
+    mapping:
+      - "dcache_set_idx"
+    queue:
+      - "dcache_mshr_full"
+
+observability:
+  use_rdcycle: true
+  observable_events:
+    - "dcache_hit"
+    - "dcache_miss"
+    - "bp_mispredict"
+
