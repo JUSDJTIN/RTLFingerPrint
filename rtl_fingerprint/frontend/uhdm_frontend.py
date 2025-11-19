@@ -5,16 +5,16 @@ from typing import List, Optional
 import subprocess
 import fnmatch
 from ..ir import RTLIR, SignalIR, Expr
-from uhdm import uhdm, util
-
-from dataclasses import dataclass, field
-from typing import List
+from ..uhdm_compat import get_uhdm
 
 from ..rmmg.graph import RmmgGraph
 from ..rmmg.builder import build_rmmg_from_design
 from ..rmmg.annotator import annotate_basic_semantics
 #from ..rmmg.annotator import annotate_basic_semantics
 # from .base import FrontendBase  # 如果有基类就解开这行注释
+
+
+uhdm, util = get_uhdm()
 
 
 class UHDMFrontend:  # 如果有 FrontendBase 就写 UHDMFrontend(FrontendBase)
@@ -40,27 +40,30 @@ class UHDMFrontend:  # 如果有 FrontendBase 就写 UHDMFrontend(FrontendBase)
 
     # ---------- 1) 调用 surelog 生成 surelog.uhdm + 反序列化 ----------
     def _run_surelog_and_load_uhdm(self):
-        #workdir = Path(".").resolve()
-        slpp_dir = self.workdir / "slpp_all"
-        uhdm_bin = slpp_dir / "surelog.uhdm"
+        explicit_db = self._explicit_uhdm_path()
+        if explicit_db is not None:
+            uhdm_bin = explicit_db
+        else:
+            slpp_dir = self.workdir / "slpp_all"
+            uhdm_bin = slpp_dir / "surelog.uhdm"
 
-        cmd = [
-            "surelog",
-            "-top", self.cfg.top_module,
-            "-f", self.cfg.rtl_filelist,
-            "-elabuhdm",
-            "-d", "uhdm",
-            "-parse",
-        ]
-        print("[INFO] Running Surelog:", " ".join(cmd))
-        ret = subprocess.run(cmd, cwd=self.workdir)
-        if ret.returncode != 0:
-            raise RuntimeError(
-                f"Surelog failed: {ret.returncode}, see {slpp_dir}/surelog.log"
-            )
+            cmd = [
+                "surelog",
+                "-top", self.cfg.top_module,
+                "-f", self.cfg.rtl_filelist,
+                "-elabuhdm",
+                "-d", "uhdm",
+                "-parse",
+            ]
+            print("[INFO] Running Surelog:", " ".join(cmd))
+            ret = subprocess.run(cmd, cwd=self.workdir)
+            if ret.returncode != 0:
+                raise RuntimeError(
+                    f"Surelog failed: {ret.returncode}, see {slpp_dir}/surelog.log"
+                )
 
-        if not uhdm_bin.exists():
-            raise FileNotFoundError(f"UHDM database not found: {uhdm_bin}")
+            if not uhdm_bin.exists():
+                raise FileNotFoundError(f"UHDM database not found: {uhdm_bin}")
 
         #s = uhdm.Serializer()
         designs = self.serializer.Restore(str(uhdm_bin))
@@ -77,6 +80,23 @@ class UHDMFrontend:  # 如果有 FrontendBase 就写 UHDMFrontend(FrontendBase)
         #    print("Fullname:",uhdm.vpi_get_str(uhdm.vpiFullName,vpiObj_module))
         print("[INFO] UHDM design restored")
         #return design
+
+    def _explicit_uhdm_path(self) -> Optional[Path]:
+        if not getattr(self.cfg, "uhdm_database", None):
+            return None
+
+        candidate = Path(self.cfg.uhdm_database)
+        if not candidate.is_absolute():
+            candidate = (self.workdir / candidate).resolve()
+
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"Configured UHDM database not found: {candidate}. "
+                "Provide a valid slpp_dir/surelog.uhdm produced by Surelog."
+            )
+
+        print(f"[INFO] Using pre-generated UHDM database: {candidate}")
+        return candidate
 
     def build_rmmg(self) -> RmmgGraph:
         if self.design is None:
