@@ -1,6 +1,6 @@
 # rtl_fingerprint/config.py
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import yaml
 
 
@@ -12,7 +12,8 @@ class Config:
     analysis: Dict[str, Any]
     observability: Dict[str, Any]
     frontend: str = "toy"  # "toy" or "uhdm"
-    arch_visible_rules:List[Dict[str, Any]] = field(default_factory=list)
+    arch_visible_rules: List[Dict[str, Any]] = field(default_factory=list)
+    uhdm_database: Optional[str] = None
 
 
 def load_config(path: str) -> Config:
@@ -28,5 +29,6 @@ def load_config(path: str) -> Config:
         observability=cfg_raw.get("observability", {}),
         frontend=cfg_raw.get("frontend", "toy"),
         arch_visible_rules=rtl_target.get("arch_visible_rules",[]),
+        uhdm_database=rtl_cfg.get("uhdm_database"),
     )
 

@@ -1,0 +1,14 @@
+frontend: "uhdm"
+
+rtl:
+  filelist: "tests/data/width_demo.f"
+  top_module: "width_demo"
+  defines: []
+
+# Minimal target scaffolding so the compiler can run
+targets:
+  mechanisms: []
+  modules: []
+  signal_patterns: {}
+
+observability: {}

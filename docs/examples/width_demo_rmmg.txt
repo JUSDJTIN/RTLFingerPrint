@@ -1,0 +1,24 @@
+NODE 0 clk kind=input width=1 arch_visible=False
+NODE 1 data_in kind=input width=8 arch_visible=False
+NODE 2 flag kind=output width=1 arch_visible=False
+NODE 3 wide_bus kind=output width=16 arch_visible=False
+NODE 4 work@width_demo.clk kind=net width=1 arch_visible=False
+NODE 5 work@width_demo.data_in kind=net width=8 arch_visible=False
+NODE 6 work@width_demo.flag kind=net width=1 arch_visible=False
+NODE 7 work@width_demo.wide_bus kind=net width=16 arch_visible=False
+NODE 8 work@width_demo.nibble kind=logic width=4 arch_visible=False
+NODE 9 work@width_demo.narrow kind=logic width=3 arch_visible=False
+NODE 10 work@width_demo.line_mem kind=memory width=8 arch_visible=False
+NODE 11 work@width_demo.clk.clk kind=internal width=1 arch_visible=False
+NODE 12 work@width_demo.data_in.data_in kind=internal width=1 arch_visible=False
+NODE 13 work@width_demo.flag.flag kind=internal width=1 arch_visible=False
+NODE 14 work@width_demo.wide_bus.wide_bus kind=internal width=1 arch_visible=False
+EDGE 0->11 seq=False cond=None
+EDGE 1->12 seq=False cond=None
+EDGE 13->2 seq=False cond=None
+EDGE 14->3 seq=False cond=None
+EDGE 5->8 seq=False cond=None
+EDGE 5->9 seq=False cond=None
+EDGE 5->7 seq=False cond=None
+EDGE 5->7 seq=False cond=None
+EDGE 8->6 seq=False cond=None

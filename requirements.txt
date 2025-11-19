@@ -1,0 +1,5 @@
+# Python dependencies for RTLFingerPrint.
+# UHDM Python bindings come from the Surelog build and are not published on PyPI.
+pyyaml>=6.0
+pyverilog>=1.3.0
+pytest>=8.0
