@@ -6,6 +6,8 @@ rtl:
   filelist: "chipyard_filelist.f"   # toy 前端不会真正用到
   top_module: "DigitalTop"
   defines: []
+  # 可选：直接指向现有的 Surelog 数据库，例如 slpp_dir/surelog.uhdm
+  # uhdm_database: "slpp_dir/surelog.uhdm"
 
 targets:
   mechanisms: ["mapping", "queue"]

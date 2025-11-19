@@ -1,13 +1,19 @@
 # rtl_fingerprint/rmmg/builder.py
 
 from __future__ import annotations
-from typing import Optional
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
-from uhdm import uhdm, util  # UHDM Python API
+from ..uhdm_compat import get_uhdm
+
+uhdm, util = get_uhdm()
 
 from .graph import RmmgGraph, RmmgNode
 
 ASSIGN_TYPES = []
+_KNOWN_WIDTHS: Dict[str, int] = {}
+_SOURCE_CACHE: Dict[str, List[str]] = {}
 
 # vpiAssignment 通常一定有
 
@@ -163,6 +169,8 @@ def _ensure_port_node(g: RmmgGraph, port) -> int:
         kind = "inout"
 
     width = _get_width(port)
+    if full_name:
+        _KNOWN_WIDTHS[full_name] = width
     node_id = g.add_node(full_name, kind, width, uhdm_obj=port)
 
     # 在 builder 里拆 module_path / signal_name
@@ -183,7 +191,10 @@ def _ensure_signal_node(g: RmmgGraph, obj, kind_override: Optional[str] = None) 
     else:
         t = uhdm.vpi_get(uhdm.vpiType, obj)
         if t == uhdm.vpiNet:
-            kind = "net"
+            if _has_unpacked_dims(obj):
+                kind = "memory"
+            else:
+                kind = "logic" if _is_logic_decl(obj) else "net"
         elif t == uhdm.vpiReg:
             kind = "reg"
         elif t == uhdm.vpiLogicVar:
@@ -194,6 +205,8 @@ def _ensure_signal_node(g: RmmgGraph, obj, kind_override: Optional[str] = None) 
             kind = "internal"
 
     width = _get_width(obj)
+    if full_name in _KNOWN_WIDTHS and (_KNOWN_WIDTHS[full_name] or 0) > max(width, 0):
+        width = _KNOWN_WIDTHS[full_name]
     node_id = g.add_node(full_name, kind, width, uhdm_obj=obj)
 
     # 这里同样拆 module_path / signal_name
@@ -232,7 +245,57 @@ def _split_module_path(hier_name: str) -> Tuple[str, str]:
 ################# get width #########################
 
 
-from uhdm import uhdm, util
+def _literal_to_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(text, 0)
+    except ValueError:
+        if "'" in text:
+            _, encoded = text.split("'", 1)
+            if not encoded:
+                return None
+            base_char = encoded[0].lower()
+            digits = encoded[1:].replace("_", "")
+            base_map = {"h": 16, "d": 10, "b": 2, "o": 8}
+            base = base_map.get(base_char, 10)
+            try:
+                return int(digits or "0", base)
+            except ValueError:
+                return None
+        return None
+
+
+def _range_dim(r) -> int | None:
+    if r is None:
+        return None
+    left = uhdm.vpi_handle(uhdm.vpiLeftRange, r)
+    right = uhdm.vpi_handle(uhdm.vpiRightRange, r)
+    lval = _literal_to_int(uhdm.vpi_get_str(uhdm.vpiDecompile, left))
+    rval = _literal_to_int(uhdm.vpi_get_str(uhdm.vpiDecompile, right))
+    if lval is None or rval is None:
+        return None
+    return abs(lval - rval) + 1
+
+
+def _resolve_actual_typespec(ts):
+    ref_type = getattr(uhdm, "vpiRefTypespec", None)
+    actual_tag = getattr(uhdm, "vpiActualTypespec", None)
+    seen: Set[int] = set()
+    while ts is not None and ref_type is not None and \
+            uhdm.vpi_get(uhdm.vpiType, ts) == ref_type and id(ts) not in seen:
+        seen.add(id(ts))
+        next_ts = uhdm.vpi_handle(uhdm.vpiActual, ts)
+        if next_ts is None and actual_tag is not None:
+            next_ts = uhdm.vpi_handle(actual_tag, ts)
+        if next_ts is None:
+            break
+        ts = next_ts
+    return ts
+
 
 def _width_from_typespec(ts) -> int | None:
     """
@@ -247,6 +310,10 @@ def _width_from_typespec(ts) -> int | None:
     if ts is None:
         return None
 
+    ts = _resolve_actual_typespec(ts) or ts
+    if ts is None:
+        return None
+
     ttype = uhdm.vpi_get(uhdm.vpiType, ts)
 
     # 1) logic_typespec: 最常见的 scalar / vector
@@ -256,11 +323,9 @@ def _width_from_typespec(ts) -> int | None:
         has_range = False
         for r in util.vpi_iterate_gen(uhdm.vpiRange, ts):
             has_range = True
-            msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-            lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-            if msb is None or lsb is None:
+            dim = _range_dim(r)
+            if dim is None:
                 return None
-            dim = abs(int(msb) - int(lsb)) + 1
             total *= dim
         return total if has_range else 1
 
@@ -271,11 +336,9 @@ def _width_from_typespec(ts) -> int | None:
 
         total = elem_w
         for r in util.vpi_iterate_gen(uhdm.vpiRange, ts):
-            msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-            lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-            if msb is None or lsb is None:
+            dim = _range_dim(r)
+            if dim is None:
                 return None
-            dim = abs(int(msb) - int(lsb)) + 1
             total *= dim
         return total
 
@@ -308,6 +371,11 @@ def _width_net_like(obj) -> int:
     if obj is None:
         return 1
 
+    # 某些连接是 reference，对应 actual 节点才带真正的宽度。
+    actual = uhdm.vpi_handle(uhdm.vpiActual, obj)
+    if actual is not None:
+        return _width_net_like(actual)
+
     # 0) typespec 优先（解决 typedef/packed array/struct 等）
     ts = uhdm.vpi_handle(uhdm.vpiTypespec, obj)
     w = _width_from_typespec(ts)
@@ -328,12 +396,10 @@ def _width_net_like(obj) -> int:
     has_range = False
     for r in util.vpi_iterate_gen(uhdm.vpiRange, obj):
         has_range = True
-        msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-        lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-        if msb is None or lsb is None:
+        dim = _range_dim(r)
+        if dim is None:
             has_range = False
             break
-        dim = abs(int(msb) - int(lsb)) + 1
         total *= dim
     if has_range and total > 0:
         return total
@@ -343,10 +409,111 @@ def _width_net_like(obj) -> int:
     if size not in (None, 0, -1):
         return int(size)
 
-    # 4) 实在没有，当 1bit
+    # 4) 源码兜底（ANSI 端口声明最常见）
+    src_width = _width_from_source(obj)
+    if src_width is not None and src_width > 0:
+        return src_width
+
+    # 5) 尝试通过 port 反推（input/output 没挂 typespec 的情况）
+    via_port = _width_via_parent_port(obj)
+    if via_port is not None and via_port > 0:
+        return via_port
+
+    # 6) 实在没有，当 1bit
     return 1
 
-def _width_port_old(port) -> int:
+
+def _width_via_parent_port(obj) -> int | None:
+    parent = uhdm.vpi_handle(uhdm.vpiParent, obj)
+    if parent is None:
+        return None
+
+    target_name = _get_full_name(obj)
+    for port in util.vpi_iterate_gen(uhdm.vpiPort, parent):
+        for tag in (uhdm.vpiLowConn, uhdm.vpiHighConn):
+            conn = uhdm.vpi_handle(tag, port)
+            if conn is None:
+                continue
+            if conn is obj:
+                return _width_port(port)
+            conn_name = _get_full_name(conn)
+            if target_name and conn_name == target_name:
+                return _width_port(port)
+            actual = uhdm.vpi_handle(uhdm.vpiActual, conn)
+            if actual is obj:
+                return _width_port(port)
+            if target_name and actual is not None:
+                actual_name = _get_full_name(actual)
+                if actual_name == target_name:
+                    return _width_port(port)
+    return None
+
+
+def _width_from_source(obj) -> int | None:
+    text = _get_decl_line(obj)
+    if text is None:
+        return None
+
+    # 尝试匹配 packed array 的 [msb:lsb]
+    for match in re.finditer(r"\[(?P<msb>[^:\]]+):(?P<lsb>[^\]]+)\]", text):
+        msb = _literal_to_int(match.group("msb"))
+        lsb = _literal_to_int(match.group("lsb"))
+        if msb is None or lsb is None:
+            continue
+        return abs(msb - lsb) + 1
+    return None
+
+
+def _get_decl_line(obj) -> Optional[str]:
+    loc = _get_src_loc(obj)
+    if loc is None:
+        return None
+    fname, line = loc
+    try:
+        lines = _SOURCE_CACHE.get(fname)
+        if lines is None:
+            lines = Path(fname).read_text().splitlines()
+            _SOURCE_CACHE[fname] = lines
+        if not (1 <= line <= len(lines)):
+            return None
+        return lines[line - 1]
+    except Exception:
+        return None
+
+
+def _is_logic_decl(obj) -> bool:
+    ts = uhdm.vpi_handle(uhdm.vpiTypespec, obj)
+    ts = _resolve_actual_typespec(ts)
+    if ts is None:
+        return False
+    return uhdm.vpi_get(uhdm.vpiType, ts) == getattr(uhdm, "vpiLogicTypespec", None)
+
+
+def _has_unpacked_dims(obj) -> bool:
+    text = _get_decl_line(obj)
+    if text is None:
+        return False
+    brackets = list(re.finditer(r"\[[^\]]+\]", text))
+    return len(brackets) >= 2
+
+
+_PORT_RESOLVE_GUARD: Set[int] = set()
+
+
+def _guard_key(obj) -> int:
+    name = _get_full_name(obj)
+    if name:
+        return hash(name)
+    try:
+        uid = uhdm.vpi_get(getattr(uhdm, "vpiUniqueId", 0), obj)
+        if uid not in (None, 0):
+            return int(uid)
+    except Exception:
+        pass
+    return id(obj)
+
+
+def _width_port(port) -> int:
     """
     端口位宽计算优先级：
       1) port 自己的 typespec
@@ -357,50 +524,60 @@ def _width_port_old(port) -> int:
     if port is None:
         return 1
 
-    # 1) 端口自身的 typespec（标准 1800-2017 推荐的写法）
-    ts = uhdm.vpi_handle(uhdm.vpiTypespec, port)
-    w_ts = _width_from_typespec(ts)
-    if w_ts is not None and w_ts > 0:
-        return w_ts
+    key = _guard_key(port)
+    if key in _PORT_RESOLVE_GUARD:
+        return 1
 
-    # 2) lowConn / highConn（连接到内部 net/reg 或上级信号）
-    cand = []
-    for tag in (uhdm.vpiLowConn, uhdm.vpiHighConn):
-        conn = uhdm.vpi_handle(tag, port)
-        if conn is None:
-            continue
-        c_type = uhdm.vpi_get(uhdm.vpiType, conn)
-        if c_type == uhdm.vpiPort:
-            cw = _width_port(conn)
-        else:
-            cw = _width_net_like(conn)
-        cand.append(cw)
+    _PORT_RESOLVE_GUARD.add(key)
+    try:
+        # 1) 端口自身的 typespec（标准 1800-2017 推荐的写法）
+        ts = uhdm.vpi_handle(uhdm.vpiTypespec, port)
+        w_ts = _width_from_typespec(ts)
+        if w_ts is not None and w_ts > 0:
+            return w_ts
 
-    for cw in cand:
-        if cw is not None and cw > 0:
-            return cw
+        src_width = _width_from_source(port)
+        if src_width is not None and src_width > 0:
+            return src_width
 
-    # 3) port 自身的 range/size
-    total = 1
-    has_range = False
-    for r in util.vpi_iterate_gen(uhdm.vpiRange, port):
-        has_range = True
-        msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-        lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-        if msb is None or lsb is None:
-            has_range = False
-            break
-        dim = abs(int(msb) - int(lsb)) + 1
-        total *= dim
-    if has_range and total > 0:
-        return total
+        # 2) lowConn / highConn（连接到内部 net/reg 或上级信号）
+        for tag in (uhdm.vpiLowConn, uhdm.vpiHighConn):
+            conn = uhdm.vpi_handle(tag, port)
+            if conn is None:
+                continue
+            c_type = uhdm.vpi_get(uhdm.vpiType, conn)
+            if c_type == uhdm.vpiPort:
+                cw = _width_port(conn)
+            else:
+                cw = _width_net_like(conn)
+            if cw is not None and cw > 0:
+                return cw
 
-    size = uhdm.vpi_get(uhdm.vpiSize, port)
-    if size not in (None, 0, -1):
-        return int(size)
+        # 3) port 自身的 range/size
+        total = 1
+        has_range = False
+        for r in util.vpi_iterate_gen(uhdm.vpiRange, port):
+            has_range = True
+            dim = _range_dim(r)
+            if dim is None:
+                has_range = False
+                break
+            total *= dim
+        if has_range and total > 0:
+            return total
 
-    # 4) 全部失败，当 scalar
-    return 1
+        size = uhdm.vpi_get(uhdm.vpiSize, port)
+        if size not in (None, 0, -1):
+            return int(size)
+
+        src_width = _width_from_source(port)
+        if src_width is not None and src_width > 0:
+            return src_width
+
+        # 4) 全部失败，当 scalar
+        return 1
+    finally:
+        _PORT_RESOLVE_GUARD.discard(key)
 
 def _get_width(obj) -> int:
     """
@@ -415,203 +592,11 @@ def _get_width(obj) -> int:
     obj_type = uhdm.vpi_get(uhdm.vpiType, obj)
 
     if obj_type == uhdm.vpiPort:
-        #return _width_port(obj)
-        return _debug_port_width(obj)
+        return _width_port(obj)
 
     if obj_type in (uhdm.vpiNet, uhdm.vpiReg, uhdm.vpiLogicVar, uhdm.vpiMemory):
         return _width_net_like(obj)
 
-    return 1
-
-########claude#######################################
-
-def _width_net_like(obj) -> int:
-    """
-    vpiNet / vpiReg / vpiLogicVar / vpiMemory / vpiLogicNet width.
-    Enhanced to handle more UHDM object types and check actual_obj reference.
-    """
-    if obj is None:
-        return 1
-
-    # CRITICAL FIX: For port connections, UHDM sometimes wraps the actual
-    # signal in a reference. Try to unwrap it first.
-    actual_obj = uhdm.vpi_handle(uhdm.vpiActual, obj)
-    if actual_obj is not None:
-        # Recursively get width from the actual object
-        return _width_net_like(actual_obj)
-
-    # 0) typespec priority (handles typedef/packed array/struct)
-    ts = uhdm.vpi_handle(uhdm.vpiTypespec, obj)
-    w = _width_from_typespec(ts)
-    if w is not None and w > 0:
-        return w
-
-    obj_type = uhdm.vpi_get(uhdm.vpiType, obj)
-
-    # 1) memory: check element type width
-    if obj_type == uhdm.vpiMemory:
-        elem = uhdm.vpi_handle(uhdm.vpiElement, obj)
-        if elem is not None:
-            return _width_net_like(elem)
-        return 1
-
-    # 2) Check ranges on the object itself
-    total = 1
-    has_range = False
-    for r in util.vpi_iterate_gen(uhdm.vpiRange, obj):
-        has_range = True
-        msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-        lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-        if msb is None or lsb is None:
-            has_range = False
-            break
-        dim = abs(int(msb) - int(lsb)) + 1
-        total *= dim
-    
-    if has_range and total > 0:
-        return total
-
-    # 3) vpiSize fallback
-    size = uhdm.vpi_get(uhdm.vpiSize, obj)
-    if size not in (None, 0, -1):
-        return int(size)
-
-    # 4) Last resort: default to 1bit
-    return 1
-
-
-def _width_port(port) -> int:
-    """
-    Port width calculation with improved fallback strategy.
-    """
-    if port is None:
-        return 1
-
-    # 1) Port's own typespec (standard IEEE 1800-2017)
-    ts = uhdm.vpi_handle(uhdm.vpiTypespec, port)
-    w_ts = _width_from_typespec(ts)
-    if w_ts is not None and w_ts > 0:
-        return w_ts
-
-    # 2) Check lowConn FIRST (more reliable - points to internal signal)
-    low_conn = uhdm.vpi_handle(uhdm.vpiLowConn, port)
-    if low_conn is not None:
-        low_type = uhdm.vpi_get(uhdm.vpiType, low_conn)
-        if low_type == uhdm.vpiPort:
-            low_width = _width_port(low_conn)
-        else:
-            low_width = _width_net_like(low_conn)
-        
-        if low_width is not None and low_width > 0:
-            return low_width
-
-    # 3) Try highConn as backup
-    high_conn = uhdm.vpi_handle(uhdm.vpiHighConn, port)
-    if high_conn is not None:
-        high_type = uhdm.vpi_get(uhdm.vpiType, high_conn)
-        if high_type == uhdm.vpiPort:
-            high_width = _width_port(high_conn)
-        else:
-            high_width = _width_net_like(high_conn)
-        
-        if high_width is not None and high_width > 0:
-            return high_width
-
-    # 4) Port's own range/size
-    total = 1
-    has_range = False
-    for r in util.vpi_iterate_gen(uhdm.vpiRange, port):
-        has_range = True
-        msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-        lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-        if msb is None or lsb is None:
-            has_range = False
-            break
-        dim = abs(int(msb) - int(lsb)) + 1
-        total *= dim
-    
-    if has_range and total > 0:
-        return total
-
-    size = uhdm.vpi_get(uhdm.vpiSize, port)
-    if size not in (None, 0, -1):
-        return int(size)
-
-    # 5) Fallback to scalar
-    return 1
-
-
-# ENHANCED DEBUG VERSION - Add vpiActual check
-def _debug_port_width(port) -> int:
-    """
-    Enhanced debug version that checks vpiActual references.
-    """
-    if port is None:
-        print("  [DEBUG] Port is None")
-        return 1
-    
-    port_name = _get_full_name(port)
-    print(f"\n[DEBUG] Checking width for port: {port_name}")
-    
-    # Check typespec
-    ts = uhdm.vpi_handle(uhdm.vpiTypespec, port)
-    if ts:
-        w_ts = _width_from_typespec(ts)
-        print(f"  - Typespec width: {w_ts}")
-        if w_ts and w_ts > 0:
-            return w_ts
-    else:
-        print(f"  - No typespec found")
-    
-    # Check lowConn with vpiActual unwrapping
-    low_conn = uhdm.vpi_handle(uhdm.vpiLowConn, port)
-    if low_conn:
-        low_name = _get_full_name(low_conn)
-        low_type = uhdm.vpi_get(uhdm.vpiType, low_conn)
-        print(f"  - LowConn: {low_name}, type: {low_type}")
-        
-        # NEW: Check if it has vpiActual reference
-        actual = uhdm.vpi_handle(uhdm.vpiActual, low_conn)
-        if actual:
-            actual_name = _get_full_name(actual)
-            actual_type = uhdm.vpi_get(uhdm.vpiType, actual)
-            print(f"  - LowConn->Actual: {actual_name}, type: {actual_type}")
-            
-            # Check actual's typespec
-            actual_ts = uhdm.vpi_handle(uhdm.vpiTypespec, actual)
-            if actual_ts:
-                actual_w = _width_from_typespec(actual_ts)
-                print(f"  - Actual's typespec width: {actual_w}")
-                if actual_w and actual_w > 0:
-                    return actual_w
-            
-            # Check actual's ranges
-            for r in util.vpi_iterate_gen(uhdm.vpiRange, actual):
-                msb = uhdm.vpi_get(uhdm.vpiLeftRange, r)
-                lsb = uhdm.vpi_get(uhdm.vpiRightRange, r)
-                print(f"  - Actual's range: [{msb}:{lsb}]")
-                if msb is not None and lsb is not None:
-                    return abs(int(msb) - int(lsb)) + 1
-            
-            # Check actual's size
-            actual_size = uhdm.vpi_get(uhdm.vpiSize, actual)
-            print(f"  - Actual's vpiSize: {actual_size}")
-            if actual_size not in (None, 0, -1):
-                return int(actual_size)
-        
-        # Original lowConn checks
-        if low_type == uhdm.vpiPort:
-            low_width = _width_port(low_conn)
-        else:
-            low_width = _width_net_like(low_conn)
-        print(f"  - LowConn width: {low_width}")
-        
-        if low_width and low_width > 0:
-            return low_width
-    else:
-        print(f"  - No lowConn")
-    
-    print(f"  [RESULT] Defaulting to width=1")
     return 1
 
 
